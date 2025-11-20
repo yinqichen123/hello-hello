@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "edu.sjsu.cmpe172.hellohello";
+option java_outer_classname = "PostReplicaProto";
+
+package edu.sjsu.cmpe172.hellohello;
+
+// The gRPC service definition.
+service PostReplicaService {
+  // Leader sends a NewPostRequest to a replica; replica returns a single reply.
+  rpc newPost(NewPostRequest) returns (NewPostReply);
+
+  // Get the last transaction ID from the replica.
+  rpc getLastTxn(GetLastTxnRequest) returns (GetLastTxnReply);
+
+  // Leader tells replica to delete all the posts after a certain transaction ID.
+  rpc deleteAfter(DeleteAfterRequest) returns (DeleteAfterReply);
+
+  // Leader tells replica to commit posts up to a certain transaction ID.
+  rpc commitUpTo(CommitUpToRequest) returns (CommitUpToReply);
+}
+
+message DeleteAfterRequest {
+  int64 txn = 1;
+  int64 leaderZxid = 2;
+}
+
+message DeleteAfterReply {
+  AddPostStatus status = 1;
+}
+
+message CommitUpToRequest {
+  int64 txn = 1;
+  int64 leaderZxid = 2;
+}
+
+message CommitUpToReply {
+  AddPostStatus status = 1;
+}
+
+message GetLastTxnRequest {
+  // Empty message
+}
+
+message GetLastTxnReply {
+  int64 lastTxn = 1;
+}
+
+// Request to create a new post.
+message NewPostRequest {
+  string message = 1;
+  string author = 2;
+  int64 timestamp = 3;
+  int64 txn = 4;
+  int64 leaderZxid = 5;
+  int64 lastCommittedTxn = 6;
+}
+
+// Possible outcomes for adding a post.
+enum AddPostStatus {
+  // something unexpected happened
+  ADD_UNSPECIFIED = 0;
+  // post was added successfully
+  ADD_SUCCESS = 1;
+  // post addition failed
+  ADD_FAILED = 2;
+  // received a transaction without receiving a prior transaction
+  ADD_MISSING_TXN = 3;
+  // the leader is not recognized by this replica
+  ADD_NOT_MY_LEADER = 4;
+}
+
+// Reply after attempting to add a post.
+message NewPostReply {
+  AddPostStatus status = 1;
+  int64 last_version = 2;
+}
