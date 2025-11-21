@@ -14,11 +14,16 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 @Service
 public class ZooKeeperService implements Watcher {
 
     private static final Logger logger = LoggerFactory.getLogger(ZooKeeperService.class);
+    
+    // Executor for async peer synchronization
+    private final ExecutorService syncExecutor = Executors.newSingleThreadExecutor();
 
     @Value("${zkConnectString}")
     private String zkConnectString;
@@ -171,6 +176,12 @@ public class ZooKeeperService implements Watcher {
             }
 
             logger.info("Replicas list updated: {}", replicas);
+            
+            // Check if we should become leader after replicas list update
+            if (replicas.contains(serverId) && currentLeader == null && wantsToLead) {
+                logger.info("Now in replicas list and no leader exists, attempting to become leader");
+                tryToBecomeLeader();
+            }
 
         } catch (KeeperException.NoNodeException e) {
             replicas.clear();
@@ -267,13 +278,24 @@ public class ZooKeeperService implements Watcher {
 
         logger.info("Syncing {} new peers", peersToSync.size());
 
+        // Execute synchronization asynchronously to avoid blocking ZooKeeper event thread
         for (String peerId : peersToSync) {
             String address = peerAddresses.get(peerId);
             if (address != null) {
-                boolean success = replicationService.syncPeer(peerId, address);
-                if (success) {
-                    addToReplicas(peerId);
-                }
+                syncExecutor.submit(() -> {
+                    try {
+                        logger.info("Async sync started for peer {}", peerId);
+                        boolean success = replicationService.syncPeer(peerId, address);
+                        if (success) {
+                            addToReplicas(peerId);
+                            logger.info("Peer {} successfully synced and added to replicas", peerId);
+                        } else {
+                            logger.warn("Failed to sync peer {}", peerId);
+                        }
+                    } catch (Exception e) {
+                        logger.error("Exception during async sync of peer {}: {}", peerId, e.getMessage());
+                    }
+                });
             }
         }
     }
@@ -371,12 +393,19 @@ public class ZooKeeperService implements Watcher {
     @PreDestroy
     public void cleanup() {
         try {
+            // Shutdown sync executor
+            syncExecutor.shutdown();
+            if (!syncExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                syncExecutor.shutdownNow();
+            }
+            
             if (zooKeeper != null) {
                 zooKeeper.close();
                 logger.info("ZK connection closed");
             }
         } catch (InterruptedException e) {
             logger.error("Error closing ZooKeeper connection", e);
+            syncExecutor.shutdownNow();
         }
     }
 

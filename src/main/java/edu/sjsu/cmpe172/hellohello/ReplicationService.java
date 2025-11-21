@@ -16,6 +16,8 @@ public class ReplicationService {
 
     private static final Logger logger = LoggerFactory.getLogger(ReplicationService.class);
     private static final int GRPC_TIMEOUT_SECONDS = 5;
+    private static final int SYNC_RETRY_ATTEMPTS = 3;
+    private static final int SYNC_RETRY_DELAY_MS = 2000;
 
     @Autowired
     private ZooKeeperService zooKeeperService;
@@ -92,76 +94,98 @@ public class ReplicationService {
     }
 
     /**
-     * Sync a new peer with the leader's data
+     * Sync a new peer with the leader's data (with retry logic)
      */
     public boolean syncPeer(String serverId, String peerAddress) {
         logger.info("Syncing peer {} at {}", serverId, peerAddress);
 
-        try {
-            PostReplicaServiceGrpc.PostReplicaServiceBlockingStub stub = getStub(peerAddress);
+        // Retry logic for handling timing issues
+        for (int attempt = 1; attempt <= SYNC_RETRY_ATTEMPTS; attempt++) {
+            try {
+                // Add initial delay to allow peer's gRPC service to fully start
+                if (attempt > 1) {
+                    logger.info("Retry attempt {} for peer {}", attempt, serverId);
+                    Thread.sleep(SYNC_RETRY_DELAY_MS);
+                } else {
+                    // Even first attempt needs a small delay
+                    Thread.sleep(1000);
+                }
 
-            // Get peer's last transaction
-            GetLastTxnReply lastTxnReply = stub.withDeadlineAfter(GRPC_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                    .getLastTxn(GetLastTxnRequest.newBuilder().build());
+                PostReplicaServiceGrpc.PostReplicaServiceBlockingStub stub = getStub(peerAddress);
 
-            long peerLastTxn = lastTxnReply.getLastTxn();
-            long myLastTxn = postRepository.findMaxTxn().orElse(0L);
+                // Get peer's last transaction
+                GetLastTxnReply lastTxnReply = stub.withDeadlineAfter(GRPC_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                        .getLastTxn(GetLastTxnRequest.newBuilder().build());
 
-            logger.info("Peer {} has txn={}, I have txn={}", serverId, peerLastTxn, myLastTxn);
+                long peerLastTxn = lastTxnReply.getLastTxn();
+                long myLastTxn = postRepository.findMaxTxn().orElse(0L);
 
-            long leaderZxid = zooKeeperService.getLeaderZxid();
+                logger.info("Peer {} has txn={}, I have txn={}", serverId, peerLastTxn, myLastTxn);
 
-            // If peer has extra transactions, delete them
-            if (peerLastTxn > myLastTxn) {
-                logger.info("Peer has extra transactions, deleting after {}", myLastTxn);
-                DeleteAfterRequest deleteRequest = DeleteAfterRequest.newBuilder()
-                        .setTxn(myLastTxn)
-                        .setLeaderZxid(leaderZxid)
-                        .build();
+                long leaderZxid = zooKeeperService.getLeaderZxid();
 
-                stub.withDeadlineAfter(GRPC_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                        .deleteAfter(deleteRequest);
-            }
-
-            // Send missing transactions
-            if (peerLastTxn < myLastTxn) {
-                logger.info("Sending {} missing transactions to peer", myLastTxn - peerLastTxn);
-                long lastCommittedTxn = getLastCommittedTxn();
-
-                for (long txn = peerLastTxn + 1; txn <= myLastTxn; txn++) {
-                    Optional<PostItem> postOpt = postRepository.findByTxn(txn);
-                    if (postOpt.isEmpty()) {
-                        logger.error("Missing transaction {} in my database!", txn);
-                        return false;
-                    }
-
-                    PostItem post = postOpt.get();
-                    NewPostRequest request = NewPostRequest.newBuilder()
-                            .setMessage(post.getMessage())
-                            .setAuthor(post.getAuthor())
-                            .setTimestamp(post.getTimestamp())
-                            .setTxn(post.getTxn())
+                // If peer has extra transactions, delete them
+                if (peerLastTxn > myLastTxn) {
+                    logger.info("Peer has extra transactions, deleting after {}", myLastTxn);
+                    DeleteAfterRequest deleteRequest = DeleteAfterRequest.newBuilder()
+                            .setTxn(myLastTxn)
                             .setLeaderZxid(leaderZxid)
-                            .setLastCommittedTxn(lastCommittedTxn)
                             .build();
 
-                    NewPostReply reply = stub.withDeadlineAfter(GRPC_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                            .newPost(request);
+                    stub.withDeadlineAfter(GRPC_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                            .deleteAfter(deleteRequest);
+                }
 
-                    if (reply.getStatus() != AddPostStatus.ADD_SUCCESS) {
-                        logger.error("Failed to sync txn {} to peer: {}", txn, reply.getStatus());
-                        return false;
+                // Send missing transactions
+                if (peerLastTxn < myLastTxn) {
+                    logger.info("Sending {} missing transactions to peer", myLastTxn - peerLastTxn);
+                    long lastCommittedTxn = getLastCommittedTxn();
+
+                    for (long txn = peerLastTxn + 1; txn <= myLastTxn; txn++) {
+                        Optional<PostItem> postOpt = postRepository.findByTxn(txn);
+                        if (postOpt.isEmpty()) {
+                            logger.error("Missing transaction {} in my database!", txn);
+                            return false;
+                        }
+
+                        PostItem post = postOpt.get();
+                        NewPostRequest request = NewPostRequest.newBuilder()
+                                .setMessage(post.getMessage())
+                                .setAuthor(post.getAuthor())
+                                .setTimestamp(post.getTimestamp())
+                                .setTxn(post.getTxn())
+                                .setLeaderZxid(leaderZxid)
+                                .setLastCommittedTxn(lastCommittedTxn)
+                                .build();
+
+                        NewPostReply reply = stub.withDeadlineAfter(GRPC_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                                .newPost(request);
+
+                        if (reply.getStatus() != AddPostStatus.ADD_SUCCESS) {
+                            logger.error("Failed to sync txn {} to peer: {}", txn, reply.getStatus());
+                            return false;
+                        }
                     }
                 }
+
+                logger.info("Successfully synced peer {}", serverId);
+                return true;
+
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                logger.error("Sync interrupted for peer {}", serverId);
+                return false;
+            } catch (Exception e) {
+                logger.warn("Sync attempt {} failed for peer {}: {}", attempt, serverId, e.getMessage());
+                if (attempt == SYNC_RETRY_ATTEMPTS) {
+                    logger.error("All sync attempts failed for peer {}", serverId);
+                    return false;
+                }
+                // Continue to next retry attempt
             }
-
-            logger.info("Successfully synced peer {}", serverId);
-            return true;
-
-        } catch (Exception e) {
-            logger.error("Error syncing peer {}: {}", serverId, e.getMessage());
-            return false;
         }
+
+        return false;
     }
 
     /**
