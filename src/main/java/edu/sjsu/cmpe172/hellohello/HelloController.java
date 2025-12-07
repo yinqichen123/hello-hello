@@ -10,6 +10,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.net.URI;
+import java.util.List;
 
 @RestController
 public class HelloController {
@@ -125,5 +126,92 @@ public class HelloController {
                 return ResponseEntity.ok(post);
             }
         }
+    }
+
+    // ========== Management Endpoints for Testing ==========
+
+    @GetMapping("/leader")
+    public ResponseEntity<?> getLeaderStatus() {
+        java.util.Map<String, Object> status = new java.util.LinkedHashMap<>();
+        status.put("status", zooKeeperService.getLeaderStatus().toString());
+        status.put("zookeeper", zooKeeperService.getZkStatus().toString());
+        status.put("leader", zooKeeperService.getCurrentLeader());
+        status.put("myid", zooKeeperService.getServerId());
+        status.put("description", zooKeeperService.getServerDescription());
+        status.put("peers", new java.util.ArrayList<>(zooKeeperService.getAllPeers().keySet()));
+        return ResponseEntity.ok(status);
+    }
+
+    @PostMapping("/leader/lead")
+    public ResponseEntity<?> startLeading() {
+        zooKeeperService.startLeading();
+        return ResponseEntity.ok("Started attempting to lead");
+    }
+
+    @PostMapping("/leader/watch")
+    public ResponseEntity<?> stopLeading() {
+        zooKeeperService.stopLeading();
+        return ResponseEntity.ok("Stopped leading, now watching");
+    }
+
+    @PostMapping("/leader/stop")
+    public ResponseEntity<?> stopLeadingAlias() {
+        zooKeeperService.stopLeading();
+        return ResponseEntity.ok("Stopped leading");
+    }
+
+    @PostMapping("/replicas/add")
+    public ResponseEntity<?> addToReplicas(@RequestParam String serverId) {
+        if (!zooKeeperService.isLeader()) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                    .body("Only leader can add to replicas");
+        }
+        zooKeeperService.addToReplicas(serverId);
+        return ResponseEntity.ok("Added " + serverId + " to replicas");
+    }
+
+    @PostMapping("/replicas/remove")
+    public ResponseEntity<?> removeFromReplicas(@RequestParam String serverId) {
+        if (!zooKeeperService.isLeader()) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                    .body("Only leader can remove from replicas");
+        }
+        zooKeeperService.removeFromReplicas(serverId);
+        return ResponseEntity.ok("Removed " + serverId + " from replicas");
+    }
+
+    @PostMapping("/replicas/join")
+    public ResponseEntity<?> joinReplicas() {
+        // Manual initialization: allow a server to add itself to replicas
+        // This can be used when replicas is empty or when the server is not yet in the list
+        List<String> currentReplicas = zooKeeperService.getReplicas();
+        String myId = zooKeeperService.getServerId();
+        
+        if (currentReplicas.contains(myId)) {
+            return ResponseEntity.ok("Already in replicas list");
+        }
+        
+        // If replicas is empty, this is the first server - allow it to join
+        if (currentReplicas.isEmpty()) {
+            zooKeeperService.addToReplicas(myId);
+            return ResponseEntity.ok("Initialized: added self to replicas (first server)");
+        }
+        
+        // If there's already a leader, only the leader can add servers
+        if (zooKeeperService.isLeader()) {
+            zooKeeperService.addToReplicas(myId);
+            return ResponseEntity.ok("Added self to replicas (as leader)");
+        }
+        
+        // If there's no leader but replicas is not empty, allow joining
+        if (zooKeeperService.getCurrentLeader() == null || zooKeeperService.getCurrentLeader().isEmpty()) {
+            zooKeeperService.addToReplicas(myId);
+            return ResponseEntity.ok("Added self to replicas (no leader exists)");
+        }
+        
+        // Otherwise, need leader to add
+        return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .body("Cannot join: replicas list is not empty and there is a leader. " +
+                      "Only leader can add servers. Current leader: " + zooKeeperService.getCurrentLeader());
     }
 }

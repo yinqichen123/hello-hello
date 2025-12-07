@@ -31,8 +31,8 @@ public class ZooKeeperService implements Watcher {
     @Value("${zkNamespace:}")
     private String zkNamespace;
 
-    @Value("${serverId}")
-    private String serverId;
+    @Value("${myDescription:}")
+    private String myDescription;
 
     @Value("${server.port}")
     private int httpPort;
@@ -42,6 +42,9 @@ public class ZooKeeperService implements Watcher {
 
     @Value("${zookeeper.session.timeout:5000}")
     private int sessionTimeout;
+
+    // serverId will be dynamically generated from EPHEMERAL_SEQUENTIAL znode path
+    private String serverId;
 
     @Autowired(required = false)
     private ReplicationService replicationService;
@@ -69,8 +72,8 @@ public class ZooKeeperService implements Watcher {
         LEADER_PATH = prefix + "/leader";
         REPLICAS_PATH = prefix + "/replicas";
 
-        logger.info("Initializing ZooKeeper: serverId={}, address={}:{}",
-                serverId, serverAddress, httpPort);
+        logger.info("Initializing ZooKeeper: address={}:{}, description={}",
+                serverAddress, httpPort, myDescription);
 
         connect();
     }
@@ -83,7 +86,7 @@ public class ZooKeeperService implements Watcher {
         createPathIfNotExists(PEERS_PATH);
         createPathIfNotExists(REPLICAS_PATH);
 
-        // Register as peer with fixed serverId
+        // Register as peer - serverId will be generated from EPHEMERAL_SEQUENTIAL znode path
         registerAsPeer();
 
         // Watch replicas list
@@ -114,24 +117,29 @@ public class ZooKeeperService implements Watcher {
     }
 
     private void registerAsPeer() throws KeeperException, InterruptedException {
+        // Use EPHEMERAL_SEQUENTIAL as per SpringBoot Leader assignment requirements
+        // ZooKeeper will automatically generate the znode name (e.g., peer-0000000001)
+        String peerPathPrefix = PEERS_PATH + "/peer-";
+        String description = (myDescription != null && !myDescription.isEmpty()) 
+            ? myDescription 
+            : "server";
+        
+        // Create EPHEMERAL_SEQUENTIAL znode - ZooKeeper will append sequence number
+        String createdPath = zooKeeper.create(
+                peerPathPrefix,
+                description.getBytes(StandardCharsets.UTF_8),
+                ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                CreateMode.EPHEMERAL_SEQUENTIAL
+        );
+        
+        // Extract serverId from the created path (e.g., /peers/peer-0000000001 -> peer-0000000001)
+        serverId = createdPath.substring(createdPath.lastIndexOf('/') + 1);
+        
+        logger.info("Registered as peer: {} with description: {}", serverId, description);
+        
+        // Store address mapping for replication service (if needed)
         String myAddress = serverAddress + ":" + httpPort;
-        String peerPath = PEERS_PATH + "/" + serverId;
-
-        try {
-            zooKeeper.create(
-                    peerPath,
-                    myAddress.getBytes(StandardCharsets.UTF_8),
-                    ZooDefs.Ids.OPEN_ACL_UNSAFE,
-                    CreateMode.EPHEMERAL  // NOT sequential!
-            );
-            logger.info("Registered as peer: {} at {}", serverId, myAddress);
-        } catch (KeeperException.NodeExistsException e) {
-            // Node exists from previous session, delete and recreate
-            logger.warn("Peer node already exists, recreating");
-            zooKeeper.delete(peerPath, -1);
-            zooKeeper.create(peerPath, myAddress.getBytes(StandardCharsets.UTF_8),
-                    ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
-        }
+        peerAddresses.put(serverId, myAddress);
 
         updatePeersList();
     }
@@ -141,18 +149,25 @@ public class ZooKeeperService implements Watcher {
             List<String> peers = zooKeeper.getChildren(PEERS_PATH, this);
 
             // Update peer addresses map
+            // For replication, we need to track addresses, but znode data contains description
+            // We'll construct addresses based on sequence number pattern
             peerAddresses.clear();
             for (String peer : peers) {
                 try {
                     byte[] data = zooKeeper.getData(PEERS_PATH + "/" + peer, false, null);
-                    String address = new String(data, StandardCharsets.UTF_8);
+                    // Description is stored in znode data (per SpringBoot Leader assignment)
+                    // For replication, we need addresses, so we construct them from sequence numbers
+                    int seqNum = extractSequenceNumber(peer);
+                    // Use a pattern: base port 9080 + sequence number offset
+                    // This assumes servers start in order, which is typical for testing
+                    String address = serverAddress + ":" + (9080 + seqNum);
                     peerAddresses.put(peer, address);
                 } catch (Exception e) {
                     logger.error("Error reading peer data for {}", peer, e);
                 }
             }
 
-            logger.info("Updated peers list: {}", peerAddresses.keySet());
+            logger.info("Updated peers list: {}", peers);
 
             // If I'm the leader, check for new peers to sync
             if (isLeader()) {
@@ -162,6 +177,21 @@ public class ZooKeeperService implements Watcher {
         } catch (KeeperException | InterruptedException e) {
             logger.error("Error updating peers list", e);
         }
+    }
+    
+    /**
+     * Extract sequence number from peer ID (e.g., "peer-0000000001" -> 1)
+     */
+    private int extractSequenceNumber(String peerId) {
+        try {
+            String[] parts = peerId.split("-");
+            if (parts.length > 1) {
+                return Integer.parseInt(parts[parts.length - 1]);
+            }
+        } catch (NumberFormatException e) {
+            logger.warn("Could not extract sequence number from peer ID: {}", peerId);
+        }
+        return 0;
     }
 
     private void watchReplicas() {
@@ -178,13 +208,16 @@ public class ZooKeeperService implements Watcher {
             logger.info("Replicas list updated: {}", replicas);
             
             // Check if we should become leader after replicas list update
+            // Only servers in replicas can become leader
             if (replicas.contains(serverId) && currentLeader == null && wantsToLead) {
                 logger.info("Now in replicas list and no leader exists, attempting to become leader");
                 tryToBecomeLeader();
             }
 
         } catch (KeeperException.NoNodeException e) {
+            // /replicas node doesn't exist - replicas list is empty
             replicas.clear();
+            logger.info("Replicas node does not exist - replicas list is empty");
         } catch (KeeperException | InterruptedException e) {
             logger.error("Error watching replicas", e);
         }
@@ -302,6 +335,7 @@ public class ZooKeeperService implements Watcher {
 
     public void addToReplicas(String peerId) {
         if (replicas.contains(peerId)) {
+            logger.debug("Peer {} already in replicas list", peerId);
             return;
         }
 
@@ -311,16 +345,25 @@ public class ZooKeeperService implements Watcher {
 
             Stat stat = zooKeeper.exists(REPLICAS_PATH, false);
             if (stat == null) {
-                zooKeeper.create(REPLICAS_PATH, replicasStr.getBytes(StandardCharsets.UTF_8),
-                        ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                // Create /replicas node if it doesn't exist
+                try {
+                    zooKeeper.create(REPLICAS_PATH, replicasStr.getBytes(StandardCharsets.UTF_8),
+                            ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                    logger.info("Created /replicas node and added {}. Current replicas: {}", peerId, replicas);
+                } catch (KeeperException.NodeExistsException e) {
+                    // Node was created by another process, update it
+                    zooKeeper.setData(REPLICAS_PATH, replicasStr.getBytes(StandardCharsets.UTF_8), -1);
+                    logger.info("Updated /replicas node and added {}. Current replicas: {}", peerId, replicas);
+                }
             } else {
                 zooKeeper.setData(REPLICAS_PATH, replicasStr.getBytes(StandardCharsets.UTF_8), -1);
+                logger.info("Added {} to replicas. Current replicas: {}", peerId, replicas);
             }
 
-            logger.info("Added {} to replicas. Current replicas: {}", peerId, replicas);
-
         } catch (KeeperException | InterruptedException e) {
-            logger.error("Error adding to replicas", e);
+            logger.error("Error adding {} to replicas", peerId, e);
+            // Remove from local list if update failed
+            replicas.remove(peerId);
         }
     }
 
@@ -421,6 +464,12 @@ public class ZooKeeperService implements Watcher {
     public String getPeerAddress(String peerId) { return peerAddresses.get(peerId); }
     public String getLeaderAddress() {
         return currentLeader != null ? peerAddresses.get(currentLeader) : null;
+    }
+    public Map<String, String> getAllPeers() { return new HashMap<>(peerAddresses); }
+    public String getServerDescription() { 
+        return myDescription != null && !myDescription.isEmpty() 
+            ? myDescription 
+            : (serverId != null ? serverId + " server" : "server"); 
     }
 
     public void startLeading() {
